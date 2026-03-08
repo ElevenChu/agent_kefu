@@ -1,4 +1,4 @@
-# 基于Langraph构建的智能客服系统
+# 基于LangGraph构建的智能客服系统
 
 一个基于 FastAPI 智能客服项目，支持多种大语言模型，如DeepSeek V3，Qwen2.5系列，Llama3系列等。涵盖了 Agent、RAG 在智能客服领域的主流应用落地需求场景。 
 
