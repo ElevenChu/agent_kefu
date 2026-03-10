@@ -21,7 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from app.lg_agent.lg_states import AgentState, InputState, Router, GradeHallucinations
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.retrievers.cypher_examples.northwind_retriever import NorthwindCypherRetriever
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.planner.node import create_planner_node
-from app.lg_agent.kg_sub_graph.agentic_rag_agents.workflows.multi_agent.multi_tool import create_multi_tool_workflow
+from app.lg_agent.kg_sub_graph.agentic_rag_agents.workflows.multi_agent.multi_tool import create_multi_tool_workflow_parallel_simple
 from app.lg_agent.kg_sub_graph.kg_neo4j_conn import get_neo4j_graph
 from pydantic import BaseModel
 from typing import Dict, List
@@ -440,7 +440,7 @@ async def create_research_plan(
     """
 
     # 创建多工具工作流 = 子图 = 子Agent
-    multi_tool_workflow = create_multi_tool_workflow(
+    multi_tool_workflow = create_multi_tool_workflow_parallel_simple(
         llm=model,
         graph=neo4j_graph,
         tool_schemas=tool_schemas,

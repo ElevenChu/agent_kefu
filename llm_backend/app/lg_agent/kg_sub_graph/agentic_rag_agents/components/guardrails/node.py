@@ -23,24 +23,7 @@ def create_guardrails_node(
     graph: Optional[Neo4jGraph] = None,
     scope_description: Optional[str] = None,
 ) -> Callable[[InputState], Coroutine[Any, Any, dict[str, Any]]]:
-    """
-    Create a guardrails node to be used in a LangGraph workflow.
-
-    Parameters
-    ----------
-    llm : BaseChatModel
-        The LLM used to process data.
-    graph: Optional[Neo4jGraph], optional
-        The `Neo4jGraph` object used to generated a schema definition, by default None
-    scope_description : Optional[str], optional
-        A description of the application scope, by default None
-
-    Returns
-    -------
-    Callable[[InputState], OverallState]
-        The LangGraph node.
-    """
-
+ 
     # 获取包含了图表结构和范围描述的guardrails完整提示词
     guardrails_prompt = create_guardrails_prompt_template(
         graph=graph, scope_description=scope_description

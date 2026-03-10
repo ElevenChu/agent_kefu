@@ -12,21 +12,7 @@ from app.lg_agent.kg_sub_graph.prompts.kg_prompts import GUARDRAILS_SYSTEM_PROMP
 def create_guardrails_prompt_template(
     graph: Optional[Neo4jGraph] = None, scope_description: Optional[str] = None
 ) -> ChatPromptTemplate:
-    """
-    Create a guardrails prompt template.
-
-    Parameters
-    ----------
-    graph : Optional[Neo4jGraph], optional
-        The `Neo4jGraph` object used to generated a schema definition, by default None
-    scope_description : Optional[str], optional
-        A description of the application scope, by default None
-
-    Returns
-    -------
-    ChatPromptTemplate
-        The prompt template.
-    """
+ 
     scope_context = (
         f"参考此范围描述来决策:\n{scope_description}"
         if scope_description is not None
