@@ -32,23 +32,7 @@ def create_tool_selection_node(
     tool_schemas: List[type[BaseModel]],
     default_to_text2cypher: bool = True,
 ) -> Callable[[ToolSelectionInputState], Coroutine[Any, Any, Command[Any]]]:
-    """
-    Create a tool_selection node to be used in a LangGraph workflow.
-
-    Parameters
-    ----------
-    llm : BaseChatModel
-        The LLM used to process data.
-    tool_schemas : Sequence[Union[Dict[str, Any], type, Callable, BaseTool]
-        tools schemas that inform the LLM which tools are available.
-    default_to_text2cypher : bool, optional
-        Whether to attempt Text2Cypher if no tool calls are returned by the LLM, by default True
-
-    Returns
-    -------
-    Callable[[ToolSelectionInputState], ToolSelectionOutputState]
-        The LangGraph node.
-    """
+   
 
     # 构建工具选择链，由大模型根据传递过来的 Task，在预定义的工具列表中选择一个工具。
     tool_selection_chain: Runnable[Dict[str, Any], Any] = (
@@ -68,90 +52,70 @@ def create_tool_selection_node(
     # ) -> Command[Literal["text2cypher", "predefined_cypher", "customer_tools"]]:
     async def tool_selection(
         state: ToolSelectionInputState,
-    ) -> Command[Literal["cypher_query", "predefined_cypher", "customer_tools"]]:
-        """
-        Choose the appropriate tool for the given task.
-        """
-        # 调用工具选择链，生成针对每个任务要调用的工具名称和参数
-        tool_selection_output: BaseModel = await tool_selection_chain.ainvoke(
-            {"question": state.get("question", "")}
-        )
-
-        # 根据路由到对应的工具节点
-        if tool_selection_output is not None:
-            tool_name: str = tool_selection_output.model_json_schema().get("title", "")
-            print("/////////////////////////////////////////////////")
-            print(tool_name)
-            tool_args: Dict[str, Any] = tool_selection_output.model_dump() 
-            if tool_name == "predefined_cypher":
-                return Command(
-                    goto=Send(
-                        "predefined_cypher",
-                        {
-                            "task": state.get("question", ""),
-                            "query_name": tool_name,
-                            "query_parameters": tool_args,
-                            "steps": ["tool_selection"],
-                        },
-                    )
-                )
-            elif tool_name == "cypher_query":
-                return Command(
-                    goto=Send(
-                        "cypher_query",
-                        {
-                            "task": state.get("question", ""),
-                            "query_name": tool_name,
-                            "query_parameters": tool_args,
-                            "steps": ["tool_selection"],
-                        },
-                    )
-                )
-            
-            else:
-                return Command(
-                    goto=Send(
-                        "customer_tools",
-                        {
-                            "task": state.get("question", ""),
-                            "query_name": tool_name,
-                            "query_parameters": tool_args,
-                            "steps": ["tool_selection"],
-                        },
-                    )
-                )
-
-
-           
-                
-        elif default_to_text2cypher:
-            return Command(
-                    goto=Send(
-                        "cypher_query",
-                        {
-                            "task": state.get("question", ""),
-                            "query_name": tool_name,
-                            "query_parameters": tool_args,
-                            "steps": ["tool_selection"],
-                        },
-                    )
-                )
-
-        # handle instance where no tool is chosen
-        else:
-            return Command(
-                goto=Send(
-                    "error_tool_selection",
-                    {
-                        "task": state.get("question", ""),
-                        "errors": [
-                            f"Unable to assign tool to question: `{state.get('question', '')}`"
-                        ],
-                        "steps": ["tool_selection"],
-                    },
-                )
+    ) -> Dict[str: Any]:
+        question = state.get("question", "")
+        
+        # 为每个任务生成唯一标识，便于日志追踪
+        task_id = id(state)
+        
+        try:
+            # 调用工具选择链
+            tool_selection_output: BaseModel = await tool_selection_chain.ainvoke(
+                {"question": question}
             )
 
-        #return go_to_text2cypher
+            if tool_selection_output is not None:
+                tool_name: str = tool_selection_output.model_json_schema().get("title", "")
+                
+                # 根据工具名称返回不同的执行路径
+                if tool_name == "predefined_cypher":
+                    return {
+                        "next_node": "predefined_cypher",
+                        "task": question,
+                        "query_name": tool_name,
+                        "query_parameters": tool_selection_output.model_dump(),
+                        "steps": ["tool_selection"],
+                    }
+                elif tool_name == "cypher_query":
+                    return {
+                        "next_node": "cypher_query",
+                        "task": question,
+                        "query_name": tool_name,
+                        "query_parameters": tool_selection_output.model_dump(),
+                        "steps": ["tool_selection"],
+                    }
+                else:
+                    return {
+                        "next_node": "customer_tools",
+                        "task": question,
+                        "query_name": tool_name,
+                        "query_parameters": tool_selection_output.model_dump(),
+                        "steps": ["tool_selection"],
+                    }
+
+            elif default_to_text2cypher:
+                return {
+                    "next_node": "cypher_query",
+                    "task": question,
+                    "query_name": "cypher_query",
+                    "query_parameters": {},
+                    "steps": ["tool_selection"],
+                }
+
+            else:
+                return {
+                    "next_node": "error",
+                    "task": question,
+                    "error": f"Unable to assign tool to question: `{question}`",
+                    "steps": ["tool_selection"],
+                }
+
+        except Exception as e:
+            return {
+                "next_node": "error",
+                "task": question,
+                "error": str(e),
+                "steps": ["tool_selection"],
+            }
 
     return tool_selection

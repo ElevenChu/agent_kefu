@@ -36,6 +36,7 @@ from ...components.final_answer import create_final_answer_node
 
 from ...components.summarize import create_summarization_node
 
+from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.parallel_executor import create_parallel_executor
 
 
 from .edges import (
@@ -65,6 +66,7 @@ def create_multi_tool_workflow(
     max_attempts: int = 3,
     attempt_cypher_execution_on_final_attempt: bool = False,
     default_to_text2cypher: bool = True,
+     max_concurrent: int = 3,  # 新增：最大并发数
 ) -> CompiledStateGraph:
     """
     Create a multi tool Agent workflow using LangGraph.
@@ -128,15 +130,21 @@ def create_multi_tool_workflow(
     summarize = create_summarization_node(llm=llm)
 
     final_answer = create_final_answer_node()
+     # 5. 创建并行执行器
+    parallel_tool_executor = create_parallel_executor(
+        tool_selection_func=tool_selection,
+        max_concurrent=max_concurrent,
+    )
 
     # 创建状态图
     main_graph_builder = StateGraph(OverallState, input=InputState, output=OutputState)
 
     main_graph_builder.add_node(guardrails)
     main_graph_builder.add_node(planner)
-    main_graph_builder.add_node("cypher_query", cypher_query)
+    main_graph_builder.add_node(cypher_query)
     main_graph_builder.add_node(predefined_cypher)
     main_graph_builder.add_node("customer_tools", customer_tools)
+    main_graph_builder.add_node("parallel_tool_executor", parallel_tool_executor)  # 新增
     main_graph_builder.add_node(summarize)
     main_graph_builder.add_node(tool_selection)
     main_graph_builder.add_node(final_answer)
@@ -148,11 +156,14 @@ def create_multi_tool_workflow(
         "guardrails",
         guardrails_conditional_edge,
     )
-    main_graph_builder.add_conditional_edges(
+    # 并行工具调用
+    main_graph_builder.add_edge("planner", "parallel_tool_executor")
+    """ main_graph_builder.add_conditional_edges(
         "planner",
-        map_reduce_planner_to_tool_selection,  # type: ignore[arg-type, unused-ignore]
+        map_reduce_planner_to_tool_selection,  
         ["tool_selection"],
     )
+    """
 
     main_graph_builder.add_edge("cypher_query", "summarize")
     main_graph_builder.add_edge("predefined_cypher", "summarize")

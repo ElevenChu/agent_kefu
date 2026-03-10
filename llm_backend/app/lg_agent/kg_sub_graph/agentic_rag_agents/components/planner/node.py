@@ -18,21 +18,7 @@ planner_prompt = create_planner_prompt_template()
 def create_planner_node(
     llm: BaseChatModel, ignore_node: bool = False, next_action: str = "tool_selection"
 ) -> Callable[[InputState], Coroutine[Any, Any, Dict[str, Any]]]:
-    """
-    Create a planner node to be used in a LangGraph workflow.
-
-    Parameters
-    ----------
-    llm : BaseChatModel
-        The LLM used to process data.
-    ignore_node : bool, optional
-        Whether to ignore this node in the workflow, by default False
-
-    Returns
-    -------
-    Callable[[InputState], OverallState]
-        The LangGraph node.
-    """
+   
 
     # 创建planner chain
     planner_chain: Runnable[Dict[str, Any], Any] = (
@@ -40,9 +26,7 @@ def create_planner_node(
     )
 
     async def planner(state: InputState) -> Dict[str, Any]:
-        """
-        Break user query into chunks, if appropriate.
-        """
+      
 
         if not ignore_node:
             planner_output: PlannerOutput = await planner_chain.ainvoke(
