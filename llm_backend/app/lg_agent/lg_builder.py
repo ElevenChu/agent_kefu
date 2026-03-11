@@ -29,6 +29,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables.base import Runnable
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.utils.utils import retrieve_and_parse_schema_from_graph_for_prompts
 from langchain_core.prompts import ChatPromptTemplate
+from app.mcp_tools.lc_tools import mcp_tools, brave_search_tool
 import base64
 import os
 import aiohttp
@@ -126,9 +127,9 @@ def route_query(
 async def respond_to_general_query(
     state: AgentState, *, config: RunnableConfig
 ) -> Dict[str, List[BaseMessage]]:
-    """生成对一般查询的响应，完全基于大模型，不会触发任何外部服务的调用，包括自定义工具、知识库查询等。
+    """生成对一般查询的响应，支持 MCP 工具调用（实时搜索）。
 
-    当路由器将查询分类为一般问题时，将调用此节点。
+    使用 LangChain bind_tools() 方式绑定 MCP 工具，让模型自主决定是否调用搜索。
 
     Args:
         state (AgentState): 当前代理状态，包括对话历史和路由逻辑。
@@ -137,21 +138,88 @@ async def respond_to_general_query(
     Returns:
         Dict[str, List[BaseMessage]]: 包含'messages'键的字典，其中包含生成的响应。
     """
-    logger.info("-----generate general-query response-----")
-    
-    # 使用大模型生成回复
+    from langchain_core.messages import ToolMessage, SystemMessage
+
+    logger.info("-----generate general-query response with MCP tools-----")
+
+    # 1. 初始化模型并绑定 MCP 工具
     if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
-        model = ChatDeepSeek(api_key=settings.DEEPSEEK_API_KEY, model_name=settings.DEEPSEEK_MODEL, temperature=0.7, tags=["general_query"])
+        model = ChatDeepSeek(
+            api_key=settings.DEEPSEEK_API_KEY,
+            model_name=settings.DEEPSEEK_MODEL,
+            temperature=0.7,
+            tags=["general_query"]
+        )
     else:
-        model = ChatOllama(model=settings.OLLAMA_AGENT_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.7, tags=["general_query"])
-    
-    system_prompt = GENERAL_QUERY_SYSTEM_PROMPT.format(
-        logic=state.router["logic"]
-    )
-    
-    messages = [{"role": "system", "content": system_prompt}] + state.messages
-    response = await model.ainvoke(messages)
-    return {"messages": [response]}
+        model = ChatOllama(
+            model=settings.OLLAMA_AGENT_MODEL,
+            base_url=settings.OLLAMA_BASE_URL,
+            temperature=0.7,
+            tags=["general_query"]
+        )
+
+    # 绑定 MCP 工具（brave_search）
+    model_with_tools = model.bind_tools(mcp_tools)
+
+    # 2. 构建系统提示词
+    system_prompt = GENERAL_QUERY_SYSTEM_PROMPT.format(logic=state.router["logic"])
+    system_prompt += """
+
+【工具说明】
+你可以使用以下工具获取实时信息：
+- brave_search: Brave 搜索引擎，用于查询最新产品价格、新闻动态等时效性信息
+
+使用原则：只在需要实时信息时调用工具，普通问答直接回答即可。"""
+
+    messages = [SystemMessage(content=system_prompt)] + state.messages
+
+    # 3. 第一次调用模型，检查是否需要使用工具
+    logger.info("Invoking model with tools bound...")
+    response = await model_with_tools.ainvoke(messages)
+
+    # 4. 检查是否有工具调用请求
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        logger.info(f"Model requested {len(response.tool_calls)} tool call(s)")
+
+        # 将模型响应（含 tool_calls）添加到消息列表
+        messages.append(response)
+
+        # 执行每个工具调用
+        for tool_call in response.tool_calls:
+            tool_name = tool_call.get('name')
+            tool_args = tool_call.get('args', {})
+            tool_id = tool_call.get('id')
+
+            logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
+
+            # 执行对应工具
+            if tool_name == 'brave_search':
+                try:
+                    result = await brave_search_tool.ainvoke(tool_args)
+                    tool_result = str(result)
+                except Exception as e:
+                    logger.error(f"Tool execution failed: {e}")
+                    tool_result = f"搜索失败: {str(e)}"
+            else:
+                tool_result = f"未知工具: {tool_name}"
+
+            # 添加工具执行结果到消息列表
+            messages.append(ToolMessage(
+                content=tool_result,
+                tool_call_id=tool_id,
+                name=tool_name
+            ))
+
+        # 5. 再次调用模型，生成最终回复（基于工具结果）
+        logger.info("Invoking model with tool results...")
+        final_response = await model_with_tools.ainvoke(messages)
+        logger.info("Final response generated with tool context")
+        return {"messages": [final_response]}
+
+    else:
+        # 没有工具调用，直接返回模型回复
+        logger.info("No tool calls requested, returning direct response")
+        return {"messages": [response]}
 
 async def get_additional_info(
     state: AgentState, *, config: RunnableConfig
