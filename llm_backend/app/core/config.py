@@ -89,7 +89,13 @@ class Settings(BaseSettings):
     def NEO4J_CONN_URL(self) -> str:
         """构建Neo4j连接URL"""
         return f"{self.NEO4J_URL}"
-    
+
+    # 查询改写配置
+    QUERY_REWRITE_ENABLED: bool = True           # 总开关
+    QUERY_REWRITE_MAX_HISTORY_TURNS: int = 3     # 最大历史轮数
+    QUERY_REWRITE_CONFIDENCE_THRESHOLD: float = 0.7  # 置信度阈值
+    QUERY_REWRITE_TIMEOUT_MS: int = 500          # 超时时间(毫秒)
+
     class Config:
         env_file = str(ENV_FILE)  # 使用绝对路径
         env_file_encoding = "utf-8"

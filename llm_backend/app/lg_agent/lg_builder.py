@@ -18,7 +18,7 @@ from typing import cast, Literal, TypedDict, List, Dict, Any
 from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
-from app.lg_agent.lg_states import AgentState, InputState, Router, GradeHallucinations
+from app.lg_agent.lg_states import AgentState, InputState, Router, GradeHallucinations, QueryRewriteResult
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.retrievers.cypher_examples.northwind_retriever import NorthwindCypherRetriever
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.planner.node import create_planner_node
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.workflows.multi_agent.multi_tool import create_multi_tool_workflow_parallel_simple
@@ -54,6 +54,194 @@ class AdditionalGuardrailsOutput(BaseModel):
 
 # 构建日志记录器
 logger = get_logger(service="lg_builder")
+
+# Query Rewrite Prompt
+QUERY_REWRITE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你是智能客服系统的查询改写专家。
+
+任务：分析用户当前输入，结合对话历史，改写为完整、清晰的独立查询。
+
+改写规则：
+1. 指代消解：将"它"、"这个"、"那款"替换为具体实体
+   例："它多少钱？" → "小米扫地机器人Pro多少钱？"
+
+2. 省略补全：补充用户省略的主语或谓语
+   例："能打折吗？" → "智能门锁能打折吗？"
+
+3. 意图澄清：当意图模糊时，基于历史澄清
+   例："好的" → "确认购买小米扫地机器人Pro"
+
+4. 无需改写：如果当前查询已是完整意图，标记为 none
+   例："你好" → "你好"（type=none）
+
+输出要求：
+- rewritten_query: 改写后的完整查询
+- rewrite_type: none / coreference / ellipsis / clarification
+- confidence: 置信度（0-1）
+- reasoning: 改写理由（简短）"""),
+    ("human", """对话历史：
+{history}
+
+当前用户输入：{current_query}
+
+请分析并输出结构化结果。"""),
+])
+
+
+def format_conversation_history(messages: list, max_turns: int = 3) -> str:
+    """格式化对话历史"""
+    from langchain_core.messages import HumanMessage, AIMessage
+
+    valid_messages = [
+        m for m in messages
+        if isinstance(m, (HumanMessage, AIMessage))
+    ][-max_turns * 2:]
+
+    history_parts = []
+    for msg in valid_messages:
+        role = "用户" if isinstance(msg, HumanMessage) else "助手"
+        content = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+        history_parts.append(f"{role}: {content}")
+
+    return "\n".join(history_parts) if history_parts else "（无历史对话）"
+
+
+def _fallback_rewrite(query: str, start_time: float, reason: str) -> Dict[str, Any]:
+    """降级处理"""
+    import time
+    return {
+        "rewrite_result": QueryRewriteResult(
+            original_query=query,
+            rewritten_query=query,
+            rewrite_type="none",
+            confidence=0.0,
+            reasoning=reason
+        ),
+        "rewrite_latency_ms": (time.time() - start_time) * 1000
+    }
+
+
+async def rewrite_query_node(
+    state: AgentState, *, config: RunnableConfig
+) -> Dict[str, Any]:
+    """查询改写节点 """
+    from langchain_core.messages import HumanMessage
+    import asyncio
+    import time
+
+    start_time = time.time()
+    current_query = state.messages[-1].content
+    trace_id = state.trace_id
+
+    # 1. 总开关检查
+    if not settings.QUERY_REWRITE_ENABLED:
+        logger.info(f"[{trace_id}] Rewrite disabled")
+        return {
+            "rewrite_result": QueryRewriteResult(
+                original_query=current_query,
+                rewritten_query=current_query,
+                rewrite_type="none",
+                confidence=1.0,
+                reasoning="Rewrite disabled by config"
+            ),
+            "rewrite_latency_ms": 0
+        }
+
+    # 2. 快速路径：单轮对话无需改写
+    if len(state.messages) <= 1:
+        logger.info(f"[{trace_id}] Single turn, skip rewrite")
+        return {
+            "rewrite_result": QueryRewriteResult(
+                original_query=current_query,
+                rewritten_query=current_query,
+                rewrite_type="none",
+                confidence=1.0,
+                reasoning="Single turn conversation"
+            ),
+            "rewrite_latency_ms": 0
+        }
+
+    try:
+        # 3. 构建历史上下文
+        history = format_conversation_history(
+            state.messages[:-1],
+            max_turns=settings.QUERY_REWRITE_MAX_HISTORY_TURNS
+        )
+
+        # 4. 调用模型改写
+        if settings.AGENT_SERVICE == ServiceType.DEEPSEEK:
+            model = ChatDeepSeek(
+                api_key=settings.DEEPSEEK_API_KEY,
+                model_name=settings.DEEPSEEK_MODEL,
+                temperature=0.7,
+                tags=["query_rewrite"]
+            )
+        else:
+            model = ChatOllama(
+                model=settings.OLLAMA_AGENT_MODEL,
+                base_url=settings.OLLAMA_BASE_URL,
+                temperature=0.7,
+                tags=["query_rewrite"]
+            )
+
+        chain = QUERY_REWRITE_PROMPT | model.with_structured_output(QueryRewriteResult)
+
+        result: QueryRewriteResult = await asyncio.wait_for(
+            chain.ainvoke({
+                "history": history,
+                "current_query": current_query
+            }),
+            timeout=settings.QUERY_REWRITE_TIMEOUT_MS / 1000
+        )
+
+        # 5. 后处理
+        result.original_query = current_query
+
+        # 置信度阈值控制
+        if result.confidence < settings.QUERY_REWRITE_CONFIDENCE_THRESHOLD:
+            logger.warning(
+                f"[{trace_id}] Low confidence ({result.confidence:.2f}), use original"
+            )
+            result.rewritten_query = current_query
+            result.rewrite_type = "none"
+
+        # 长度保护
+        if len(result.rewritten_query) > 500:
+            result.rewritten_query = result.rewritten_query[:500]
+
+        latency_ms = (time.time() - start_time) * 1000
+
+        logger.info(
+            f"[{trace_id}] Rewrite done | type={result.rewrite_type} | "
+            f"conf={result.confidence:.2f} | {latency_ms:.1f}ms | "
+            f"'{current_query}' -> '{result.rewritten_query}'"
+        )
+
+        # 6. 关键：替换消息列表中的查询
+        rewritten_messages = list(state.messages)
+        rewritten_messages[-1] = HumanMessage(
+            content=result.rewritten_query,
+            additional_kwargs={
+                "original_query": current_query,
+                "rewrite_type": result.rewrite_type,
+                "rewrite_confidence": result.confidence
+            }
+        )
+
+        return {
+            "messages": rewritten_messages,
+            "rewrite_result": result,
+            "rewrite_latency_ms": latency_ms
+        }
+
+    except asyncio.TimeoutError:
+        logger.error(f"[{trace_id}] Rewrite timeout, fallback to original")
+        return _fallback_rewrite(current_query, start_time, "Timeout")
+
+    except Exception as e:
+        logger.error(f"[{trace_id}] Rewrite error: {e}, fallback to original")
+        return _fallback_rewrite(current_query, start_time, f"Error: {e}")
+
 
 async def analyze_and_route_query(
     state: AgentState, *, config: RunnableConfig
@@ -574,6 +762,7 @@ checkpointer = MemorySaver()
 # 定义状态图
 builder = StateGraph(AgentState, input=InputState)
 # 添加节点
+builder.add_node("rewrite_query", rewrite_query_node)  # 查询改写节点
 builder.add_node(analyze_and_route_query)
 builder.add_node(respond_to_general_query)
 builder.add_node(get_additional_info)
@@ -582,7 +771,8 @@ builder.add_node(create_image_query)
 builder.add_node(create_file_query)
 
 # 添加边
-builder.add_edge(START, "analyze_and_route_query")
+builder.add_edge(START, "rewrite_query")  # 先进行查询改写
+builder.add_edge("rewrite_query", "analyze_and_route_query")  # 改写后进入路由
 builder.add_conditional_edges("analyze_and_route_query", route_query)
 
 
