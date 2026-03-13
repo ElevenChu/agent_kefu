@@ -110,12 +110,7 @@ def create_multi_tool_workflow_parallel_simple(
     )
     customer_tools = create_graphrag_query_node()
 
-    # 4. 创建工具选择节点（仅 selection 模式使用）
-    tool_selection = create_tool_selection_node(
-        llm=llm,
-        tool_schemas=tool_schemas,
-        default_to_text2cypher=default_to_text2cypher,
-    )
+  
 
     # 5. 创建错误处理节点
     error_tool_selection = create_error_tool_selection_node()
@@ -136,7 +131,6 @@ def create_multi_tool_workflow_parallel_simple(
     main_graph_builder.add_node(predefined_cypher)    # 工具 2
     main_graph_builder.add_node("customer_tools", customer_tools)  # 工具 3
     main_graph_builder.add_node(summarize)
-    main_graph_builder.add_node(tool_selection)       # 仅 selection 模式使用
     main_graph_builder.add_node(error_tool_selection)
     main_graph_builder.add_node(final_answer)
 
