@@ -2,7 +2,7 @@
 This code is based on content found in the LangGraph documentation: https://python.langchain.com/docs/tutorials/graph/#advanced-implementation-with-langgraph
 """
 
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 
 def create_text2cypher_generation_prompt_template() -> ChatPromptTemplate:
@@ -136,6 +136,137 @@ def create_text2cypher_correction_prompt_template() -> ChatPromptTemplate:
     {errors}
 
     修正后的Cypher语句："""
+                ),
+            ),
+        ]
+    )
+
+
+def create_react_thought_prompt_template() -> ChatPromptTemplate:
+    """
+    创建ReAct思考阶段的提示模板。
+
+    返回
+    -------
+    ChatPromptTemplate
+        提示模板。
+    """
+    return ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "你是Neo4j Cypher专家。请分析当前情况并决定下一步行动。\n"
+                    "思考应该包括：\n"
+                    "1. 用户问题的核心需求是什么\n"
+                    "2. 需要查询哪些节点和关系\n"
+                    "3. 如果之前有错误，分析错误原因\n"
+                    "4. 决定下一步：生成新查询、修正错误，还是结束\n"
+                    "\n只输出思考内容，不要输出Cypher语句。"
+                ),
+            ),
+            (
+                "human",
+                (
+                    """用户问题: {question}
+
+图数据库Schema:
+{schema}
+
+当前尝试次数: {attempt}
+
+{context}
+
+请分析并给出思考："""
+                ),
+            ),
+        ]
+    )
+
+
+def create_react_cypher_generation_prompt_template() -> ChatPromptTemplate:
+    """
+    创建ReAct风格的Cypher生成提示模板（支持上下文）。
+
+    返回
+    -------
+    ChatPromptTemplate
+        提示模板。
+    """
+    return ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "你是Neo4j Cypher专家。根据用户问题和思考过程，生成正确的Cypher查询语句。\n"
+                    "规则：\n"
+                    "1. 不要在响应中包含任何反引号或其他标记\n"
+                    "2. 只使用MATCH或WITH子句开始查询\n"
+                    "3. 只返回Cypher语句，不要解释\n"
+                    "4. 如果提供了之前的错误，请务必修正\n"
+                    "5. 确保查询语法完全符合Neo4j规范"
+                ),
+            ),
+            (
+                "human",
+                (
+                    """用户问题: {question}
+
+图数据库Schema:
+{schema}
+
+参考示例:
+{fewshot_examples}
+
+思考过程:
+{thought}
+
+{error_context}
+
+请生成Cypher查询语句："""
+                ),
+            ),
+        ]
+    )
+
+
+def create_react_observation_prompt_template() -> ChatPromptTemplate:
+    """
+    创建ReAct观察阶段的提示模板。
+
+    返回
+    -------
+    ChatPromptTemplate
+        提示模板。
+    """
+    return ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                (
+                    "你是结果分析专家。请分析Cypher查询的执行结果，判断是否需要继续优化。\n"
+                    "判断标准：\n"
+                    "1. 如果结果为空，检查是否查询条件太严格\n"
+                    "2. 如果有错误，分析错误类型\n"
+                    "3. 如果结果符合预期，确认完成\n"
+                    "\n只输出分析结论，不要输出新查询。"
+                ),
+            ),
+            (
+                "human",
+                (
+                    """用户问题: {question}
+
+生成的Cypher:
+{cypher}
+
+执行结果:
+{result}
+
+错误信息:
+{errors}
+
+请分析结果是否满足用户需求，如不满足请说明原因："""
                 ),
             ),
         ]

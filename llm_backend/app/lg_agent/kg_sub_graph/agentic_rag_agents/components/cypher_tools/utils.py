@@ -3,7 +3,14 @@ import logging
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_neo4j import Neo4jGraph
-from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.cypher_tools.prompts import create_text2cypher_generation_prompt_template, create_text2cypher_validation_prompt_template, create_text2cypher_correction_prompt_template
+from app.lg_agent.kg_sub_graph.agentic_rag_agents.components.cypher_tools.prompts import (
+    create_text2cypher_generation_prompt_template,
+    create_text2cypher_validation_prompt_template,
+    create_text2cypher_correction_prompt_template,
+    create_react_thought_prompt_template,
+    create_react_cypher_generation_prompt_template,
+    create_react_observation_prompt_template,
+)
 from app.lg_agent.kg_sub_graph.agentic_rag_agents.retrievers.cypher_examples.base import BaseCypherExampleRetriever
 from typing_extensions import TypedDict
 from typing import Annotated, Any, Dict, List, Optional, Callable, Coroutine
@@ -21,6 +28,10 @@ logging.getLogger("neo4j").setLevel(logging.ERROR)
 logging.getLogger("langchain_neo4j").setLevel(logging.ERROR)
 # 禁用驱动相关日志
 logging.getLogger("neo4j.io").setLevel(logging.ERROR)
+logging.getLogger("neo4j.bolt").setLevel(logging.ERROR)
+
+# 创建模块logger
+logger = logging.getLogger(__name__)
 logging.getLogger("neo4j.bolt").setLevel(logging.ERROR)
 
 
@@ -44,6 +55,36 @@ class CypherOutputState(TypedDict):
     errors: List[str]
     records: List[Dict[str, Any]]
     steps: List[str]
+
+
+# ==================== ReAct 状态定义 ====================
+
+class ReActCypherState(TypedDict):
+    """ReAct模式下的Cypher查询状态"""
+    task: str                          # 原始任务/问题
+    thought: str                       # 当前思考
+    cypher_statement: str              # 生成的Cypher
+    execution_result: List[Dict[str, Any]]  # 执行结果
+    errors: List[str]                  # 错误信息
+    attempts: int                      # 尝试次数
+    is_complete: bool                  # 是否完成
+    should_retry: bool                 # 是否重试
+    retry_reason: str                  # 重试原因
+    steps: List[str]                   # 执行步骤
+
+
+class ReActThoughtOutput(BaseModel):
+    """ReAct思考阶段的结构化输出"""
+    thought: str = Field(description="对当前情况的分析思考")
+    action: str = Field(description="下一步行动: generate(生成)/correct(修正)/end(结束)")
+    reasoning: str = Field(description="选择该行动的理由")
+
+
+class ReActObservationOutput(BaseModel):
+    """ReAct观察阶段的结构化输出"""
+    is_satisfactory: bool = Field(description="结果是否满足需求")
+    analysis: str = Field(description="结果分析")
+    suggestion: str = Field(description="改进建议(如不满意)")
 
 class Property(BaseModel):
     """
@@ -578,3 +619,404 @@ def create_text2cypher_execution_node(
         }
 
     return execute_cypher
+
+
+# ==================== ReAct 核心函数 ====================
+
+# 定义ReAct prompt
+react_thought_prompt = create_react_thought_prompt_template()
+react_generation_prompt = create_react_cypher_generation_prompt_template()
+react_observation_prompt = create_react_observation_prompt_template()
+
+
+def create_react_thought_node(
+    llm: BaseChatModel,
+    graph: Neo4jGraph,
+) -> Callable[[ReActCypherState], Coroutine[Any, Any, Dict[str, Any]]]:
+    """
+    创建ReAct思考节点。
+
+    Parameters
+    ----------
+    llm : BaseChatModel
+        大语言模型
+    graph : Neo4jGraph
+        Neo4j图数据库连接
+
+    Returns
+    -------
+    Callable[[ReActCypherState], Dict[str, Any]]
+        思考节点函数
+    """
+    thought_chain = react_thought_prompt | llm.with_structured_output(ReActThoughtOutput)
+
+    async def generate_thought(state: ReActCypherState) -> Dict[str, Any]:
+        """生成思考过程"""
+        task = state.get("task", "")
+        attempts = state.get("attempts", 0)
+        errors = state.get("errors", [])
+
+        # 构建上下文信息
+        context_parts = []
+        if attempts > 0:
+            context_parts.append(f"之前生成的Cypher: {state.get('cypher_statement', '')}")
+            context_parts.append(f"执行结果: {state.get('execution_result', [])}")
+            if errors:
+                context_parts.append(f"错误信息: {errors}")
+        context = "\n\n".join(context_parts) if context_parts else "首次尝试，无历史信息"
+
+        try:
+            result: ReActThoughtOutput = await thought_chain.ainvoke({
+                "question": task,
+                "schema": retrieve_and_parse_schema_from_graph_for_prompts(graph),
+                "attempt": attempts + 1,
+                "context": context,
+            })
+
+            return {
+                "thought": result.thought,
+                "should_retry": result.action in ["generate", "correct"],
+                "retry_reason": result.reasoning,
+                "steps": state.get("steps", []) + [f"thought_{attempts + 1}"],
+            }
+        except Exception as e:
+            # 降级处理：直接继续
+            return {
+                "thought": f"生成思考时出错: {str(e)}，继续生成Cypher",
+                "should_retry": True,
+                "retry_reason": "默认继续",
+                "steps": state.get("steps", []) + [f"thought_{attempts + 1}_fallback"],
+            }
+
+    return generate_thought
+
+
+def create_react_cypher_generation_node(
+    llm: BaseChatModel,
+    graph: Neo4jGraph,
+    cypher_example_retriever: BaseCypherExampleRetriever,
+) -> Callable[[ReActCypherState], Coroutine[Any, Any, Dict[str, Any]]]:
+    """
+    创建ReAct风格的Cypher生成节点。
+
+    Parameters
+    ----------
+    llm : BaseChatModel
+        大语言模型
+    graph : Neo4jGraph
+        Neo4j图数据库连接
+    cypher_example_retriever : BaseCypherExampleRetriever
+        Cypher示例检索器
+
+    Returns
+    -------
+    Callable[[ReActCypherState], Dict[str, Any]]
+        生成节点函数
+    """
+    generation_chain = react_generation_prompt | llm | StrOutputParser()
+
+    async def generate_cypher(state: ReActCypherState) -> Dict[str, Any]:
+        """生成Cypher查询"""
+        task = state.get("task", "")
+        thought = state.get("thought", "")
+        attempts = state.get("attempts", 0)
+        errors = state.get("errors", [])
+
+        # 获取示例
+        examples: str = cypher_example_retriever.get_examples(
+            **{"query": task, "k": 3}
+        )
+
+        # 构建错误上下文
+        error_context = ""
+        if errors and attempts > 0:
+            error_context = f"""之前的错误:
+{chr(10).join(errors)}
+
+请务必修正上述错误，重新生成正确的Cypher查询。"""
+
+        try:
+            cypher_statement = await generation_chain.ainvoke({
+                "question": task,
+                "schema": retrieve_and_parse_schema_from_graph_for_prompts(graph),
+                "fewshot_examples": examples,
+                "thought": thought,
+                "error_context": error_context,
+            })
+
+            # 清理生成的Cypher
+            cypher_statement = cypher_statement.strip()
+            if cypher_statement.startswith("```"):
+                cypher_statement = cypher_statement.replace("```cypher", "").replace("```", "").strip()
+
+            return {
+                "cypher_statement": cypher_statement,
+                "attempts": attempts + 1,
+                "steps": state.get("steps", []) + [f"generate_{attempts + 1}"],
+            }
+        except Exception as e:
+            return {
+                "cypher_statement": "",
+                "errors": errors + [f"生成Cypher时出错: {str(e)}"],
+                "attempts": attempts + 1,
+                "steps": state.get("steps", []) + [f"generate_{attempts + 1}_error"],
+            }
+
+    return generate_cypher
+
+
+def create_react_observation_node(
+    llm: BaseChatModel,
+    graph: Neo4jGraph,
+) -> Callable[[ReActCypherState], Coroutine[Any, Any, Dict[str, Any]]]:
+    """
+    创建ReAct观察节点（执行 + 分析）。
+
+    Observation阶段包含两个子步骤：
+    1. 执行Cypher查询（Action的执行结果）
+    2. 分析执行结果，决定是否继续
+
+    Parameters
+    ----------
+    llm : BaseChatModel
+        大语言模型
+    graph : Neo4jGraph
+        Neo4j图数据库连接
+
+    Returns
+    -------
+    Callable[[ReActCypherState], Dict[str, Any]]
+        观察节点函数
+    """
+    observation_chain = react_observation_prompt | llm.with_structured_output(ReActObservationOutput)
+
+    async def observe(state: ReActCypherState) -> Dict[str, Any]:
+        """
+        执行Cypher并观察分析结果。
+
+        返回包含：
+        - execution_result: 执行结果
+        - errors: 错误信息
+        - is_complete: 是否完成
+        - should_retry: 是否重试
+        - retry_reason: 重试原因
+        """
+        task = state.get("task", "")
+        cypher_statement = state.get("cypher_statement", "").strip()
+        attempts = state.get("attempts", 0)
+        steps = state.get("steps", [])
+
+        # ========== Step 1: 执行Cypher ==========
+        execution_result = []
+        errors = []
+
+        if not cypher_statement:
+            errors.append("Cypher语句为空")
+            steps.append(f"observe_{attempts}_empty_cypher")
+        else:
+            # 清理Cypher语句
+            cypher_statement = cypher_statement.replace("\n", " ").strip()
+
+            # 检查写操作
+            write_errors = validate_no_writes_in_cypher_query(cypher_statement)
+            if write_errors:
+                errors.extend(write_errors)
+                steps.append(f"observe_{attempts}_write_error")
+            else:
+                try:
+                    # 执行查询
+                    records = graph.query(cypher_statement)
+
+                    # 处理空结果
+                    if not records:
+                        records = [{"error": "在数据库中找不到任何相关信息。"}]
+
+                    execution_result = records
+                    steps.append(f"observe_{attempts}_executed")
+                    logger.info(f"[ReAct Observation] 执行成功: {len(records)} 条记录")
+
+                except CypherSyntaxError as e:
+                    errors.append(f"Cypher语法错误: {str(e.message)}")
+                    steps.append(f"observe_{attempts}_syntax_error")
+                    logger.warning(f"[ReAct Observation] 语法错误: {e.message}")
+                except Exception as e:
+                    errors.append(f"执行异常: {str(e)}")
+                    steps.append(f"observe_{attempts}_exception")
+                    logger.error(f"[ReAct Observation] 执行异常: {e}")
+
+        # ========== Step 2: 分析结果 ==========
+
+        # 如果有执行错误，直接判定需要重试
+        if errors:
+            return {
+                "execution_result": execution_result,
+                "errors": errors,
+                "is_complete": False,
+                "should_retry": True,
+                "retry_reason": f"执行错误: {errors[-1]}",
+                "steps": steps,
+            }
+
+        # 如果结果为空（标记为error），可能需要重试
+        if not execution_result or (len(execution_result) == 1 and "error" in execution_result[0]):
+            return {
+                "execution_result": execution_result,
+                "errors": errors,
+                "is_complete": False,
+                "should_retry": attempts < 3,
+                "retry_reason": "查询结果为空，可能需要调整查询条件" if attempts < 3 else "已达到最大重试次数",
+                "steps": steps,
+            }
+
+        # 使用LLM分析结果是否满足需求
+        try:
+            result_text = str(execution_result[:5])  # 只取前5条避免过长
+        except:
+            result_text = str(execution_result)
+
+        try:
+            observation: ReActObservationOutput = await observation_chain.ainvoke({
+                "question": task,
+                "cypher": cypher_statement,
+                "result": result_text,
+                "errors": "无错误",
+            })
+
+            logger.info(f"[ReAct Observation] LLM分析: is_satisfactory={observation.is_satisfactory}")
+
+            return {
+                "execution_result": execution_result,
+                "errors": errors,
+                "is_complete": observation.is_satisfactory,
+                "should_retry": not observation.is_satisfactory and attempts < 3,
+                "retry_reason": observation.suggestion if not observation.is_satisfactory else "",
+                "steps": steps + [f"observe_{attempts}_analyzed"],
+            }
+        except Exception as e:
+            # 降级处理：假设完成
+            logger.warning(f"[ReAct Observation] LLM分析失败，降级处理: {e}")
+            return {
+                "execution_result": execution_result,
+                "errors": errors,
+                "is_complete": True,
+                "should_retry": False,
+                "retry_reason": f"结果分析出错: {str(e)}，假设结果可用",
+                "steps": steps + [f"observe_{attempts}_fallback"],
+            }
+
+    return observe
+
+
+async def run_react_cypher_loop(
+    state: Dict[str, Any],
+    llm: BaseChatModel,
+    graph: Neo4jGraph,
+    cypher_example_retriever: BaseCypherExampleRetriever,
+    max_attempts: int = 3,
+) -> Dict[str, Any]:
+    """
+    运行ReAct循环，直到完成或达到最大尝试次数。
+
+    Parameters
+    ----------
+    state : Dict[str, Any]
+        初始状态
+    llm : BaseChatModel
+        大语言模型
+    graph : Neo4jGraph
+        Neo4j图数据库连接
+    cypher_example_retriever : BaseCypherExampleRetriever
+        Cypher示例检索器
+    max_attempts : int
+        最大尝试次数
+
+    Returns
+    -------
+    Dict[str, Any]
+        最终结果
+    """
+    # 初始化ReAct状态
+    react_state: ReActCypherState = {
+        "task": state.get("task", ""),
+        "thought": "",
+        "cypher_statement": "",
+        "execution_result": [],
+        "errors": [],
+        "attempts": 0,
+        "is_complete": False,
+        "should_retry": True,
+        "retry_reason": "",
+        "steps": [],
+    }
+
+    # 创建节点
+    thought_node = create_react_thought_node(llm, graph)
+    generation_node = create_react_cypher_generation_node(llm, graph, cypher_example_retriever)
+    observation_node = create_react_observation_node(llm, graph)
+
+    logger.info(f"[ReAct] 开始处理任务: {react_state['task'][:50]}...")
+
+    while react_state["attempts"] < max_attempts and not react_state["is_complete"]:
+        current_attempt = react_state["attempts"] + 1
+        logger.info(f"[ReAct] 第 {current_attempt} 次尝试")
+
+        # ========== 1. Thought: 思考 ==========
+        logger.info(f"[ReAct] Step 1/3: 思考...")
+        thought_result = await thought_node(react_state)
+        react_state["thought"] = thought_result.get("thought", "")
+        react_state["should_retry"] = thought_result.get("should_retry", True)
+        react_state["steps"] = thought_result.get("steps", [])
+        logger.info(f"[ReAct] 思考: {react_state['thought'][:100]}...")
+
+        if not react_state["should_retry"]:
+            logger.info("[ReAct] 思考决定结束")
+            break
+
+        # ========== 2. Action: 生成Cypher ==========
+        logger.info(f"[ReAct] Step 2/3: 生成Cypher...")
+        generation_result = await generation_node(react_state)
+        react_state["cypher_statement"] = generation_result.get("cypher_statement", "")
+        react_state["attempts"] = generation_result.get("attempts", react_state["attempts"])
+        react_state["errors"] = generation_result.get("errors", [])
+        react_state["steps"] = generation_result.get("steps", react_state["steps"])
+        logger.info(f"[ReAct] 生成Cypher: {react_state['cypher_statement'][:100]}...")
+
+        if react_state["errors"] and not react_state["cypher_statement"]:
+            logger.warning(f"[ReAct] 生成失败: {react_state['errors']}")
+            continue
+
+        # ========== 3. Observation: 执行 + 分析（合并节点）==========
+        logger.info(f"[ReAct] Step 3/3: 观察（执行+分析）...")
+        observation_result = await observation_node(react_state)
+        react_state["execution_result"] = observation_result.get("execution_result", [])
+        react_state["errors"] = observation_result.get("errors", [])
+        react_state["is_complete"] = observation_result.get("is_complete", False)
+        react_state["should_retry"] = observation_result.get("should_retry", False)
+        react_state["retry_reason"] = observation_result.get("retry_reason", "")
+        react_state["steps"] = observation_result.get("steps", react_state["steps"])
+        logger.info(f"[ReAct] 执行结果: {len(react_state['execution_result'])} 条记录")
+        logger.info(f"[ReAct] 观察结论: complete={react_state['is_complete']}, retry={react_state['should_retry']}")
+
+        if react_state["is_complete"]:
+            logger.info("[ReAct] 任务完成")
+            break
+
+    # 返回最终结果
+    if react_state["attempts"] >= max_attempts and not react_state["is_complete"]:
+        logger.warning("[ReAct] 达到最大尝试次数，返回当前结果")
+        react_state["errors"].append(f"达到最大尝试次数({max_attempts})，可能无法获得理想结果")
+
+    return {
+        "cyphers": [
+            {
+                "task": react_state["task"],
+                "statement": react_state["cypher_statement"],
+                "errors": react_state["errors"],
+                "records": react_state["execution_result"],
+                "steps": react_state["steps"],
+            }
+        ],
+        "steps": react_state["steps"] + ["react_complete"],
+        "attempts": react_state["attempts"],
+        "is_complete": react_state["is_complete"],
+    }
