@@ -21,6 +21,8 @@ import regex as re
 from langchain_core.runnables.base import Runnable
 from langchain_neo4j.chains.graph_qa.cypher_utils import CypherQueryCorrector, Schema
 from neo4j.exceptions import CypherSyntaxError
+from langchain_ollama import ChatOllama
+from app.core.config import settings
 
 # 设置Neo4j驱动的日志级别为ERROR，禁止WARNING消息
 logging.getLogger("neo4j").setLevel(logging.ERROR)
@@ -680,13 +682,36 @@ def create_react_thought_node(
                 "steps": state.get("steps", []) + [f"thought_{attempts + 1}"],
             }
         except Exception as e:
-            # 降级处理：直接继续
-            return {
-                "thought": f"生成思考时出错: {str(e)}，继续生成Cypher",
-                "should_retry": True,
-                "retry_reason": "默认继续",
-                "steps": state.get("steps", []) + [f"thought_{attempts + 1}_fallback"],
-            }
+            # 降级处理：主模型失败时切换 Ollama 本地模型重试一次
+            logger.warning(f"[ReAct Thought] 主模型调用失败: {e}，尝试 Ollama 降级")
+            try:
+                fallback_llm = ChatOllama(
+                    model=settings.OLLAMA_AGENT_MODEL,
+                    base_url=settings.OLLAMA_BASE_URL,
+                    temperature=0.7,
+                )
+                fallback_chain = react_thought_prompt | fallback_llm.with_structured_output(ReActThoughtOutput)
+                result: ReActThoughtOutput = await fallback_chain.ainvoke({
+                    "question": task,
+                    "schema": retrieve_and_parse_schema_from_graph_for_prompts(graph),
+                    "attempt": attempts + 1,
+                    "context": context,
+                })
+                logger.info("[ReAct Thought] Ollama 降级成功")
+                return {
+                    "thought": result.thought,
+                    "should_retry": result.action in ["generate", "correct"],
+                    "retry_reason": result.reasoning,
+                    "steps": state.get("steps", []) + [f"thought_{attempts + 1}_ollama_fallback"],
+                }
+            except Exception as fallback_e:
+                logger.error(f"[ReAct Thought] Ollama 降级也失败: {fallback_e}，走兜底")
+                return {
+                    "thought": "生成思考时出错，继续生成Cypher",
+                    "should_retry": True,
+                    "retry_reason": "主模型和降级模型均失败",
+                    "steps": state.get("steps", []) + [f"thought_{attempts + 1}_fallback"],
+                }
 
     return generate_thought
 
